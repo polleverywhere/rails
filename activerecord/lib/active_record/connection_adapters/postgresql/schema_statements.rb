@@ -696,17 +696,64 @@ module ActiveRecord
         end
 
         def add_index(table_name, column_name, **options) # :nodoc:
-          create_index = build_create_index_definition(table_name, column_name, **options)
-          result = execute schema_creation.accept(create_index)
+          index, algorithm, if_not_exists = add_index_options(table_name, column_name, **options)
 
-          index = create_index.index
-          execute "COMMENT ON INDEX #{quote_column_name(index.name)} IS #{quote(index.comment)}" if index.comment
-          result
+          if supports_partitioned_indexes? && partitioned_table?(table_name) && !expression_column_name?(column_name)
+            add_partitioned_index(table_name, index, algorithm, if_not_exists)
+          else
+            create_index = CreateIndexDefinition.new(index, algorithm, if_not_exists)
+            result = execute schema_creation.accept(create_index)
+
+            execute "COMMENT ON INDEX #{quote_column_name(index.name)} IS #{quote(index.comment)}" if index.comment
+            result
+          end
         end
 
         def build_create_index_definition(table_name, column_name, **options) # :nodoc:
           index, algorithm, if_not_exists = add_index_options(table_name, column_name, **options)
           CreateIndexDefinition.new(index, algorithm, if_not_exists)
+        end
+
+        def add_partitioned_index(table_name, index, algorithm, if_not_exists) # :nodoc:
+          index_columns = index.columns
+          parent_index_name = index.name
+          parent_index = create_index_definition(table_name, parent_index_name, index.unique, index_columns,
+            lengths: index.lengths,
+            orders: index.orders,
+            opclasses: index.opclasses,
+            where: index.where,
+            type: index.type,
+            using: index.using,
+            include: index.include,
+            nulls_not_distinct: index.nulls_not_distinct,
+            comment: index.comment
+          )
+
+          parent_algorithm = algorithm == index_algorithms[:concurrently] ? nil : algorithm
+          parent_index_sql = create_index_sql(table_name, parent_index, parent_algorithm, if_not_exists).sub(/\s+ON\s+/i, " ON ONLY ")
+          result = execute parent_index_sql
+
+          partitions = partition_names_for(table_name)
+          partitions.each do |partition|
+            partition_name = Utils.extract_schema_qualified_name(partition)
+            child_index_name = partition_index_name(parent_index_name, partition_name.identifier)
+            child_index = create_index_definition(partition, child_index_name, index.unique, index_columns,
+              lengths: index.lengths,
+              orders: index.orders,
+              opclasses: index.opclasses,
+              where: index.where,
+              type: index.type,
+              using: index.using,
+              include: index.include,
+              nulls_not_distinct: index.nulls_not_distinct,
+              comment: index.comment
+            )
+            execute create_index_sql(partition, child_index, algorithm, if_not_exists)
+            execute "ALTER INDEX #{quote_table_name(parent_index_name)} ATTACH PARTITION #{quote_table_name(child_index_name)}"
+          end
+
+          execute "COMMENT ON INDEX #{quote_column_name(parent_index_name)} IS #{quote(index.comment)}" if index.comment
+          result
         end
 
         def remove_index(table_name, column_name = nil, **options) # :nodoc:
@@ -726,8 +773,10 @@ module ActiveRecord
           return if options[:if_exists] && !index_exists?(table_name, column_name, **options)
 
           index_to_remove = PostgreSQL::Name.new(table.schema, index_name_for_remove(table.to_s, column_name, options))
+          algorithm = options[:algorithm]
+          algorithm = nil if algorithm == :concurrently && supports_partitioned_indexes? && partitioned_table?(table_name)
 
-          execute "DROP INDEX #{index_algorithm(options[:algorithm])} #{quote_table_name(index_to_remove)}"
+          execute "DROP INDEX #{index_algorithm(algorithm)} #{quote_table_name(index_to_remove)}"
         end
 
         # Renames an index of a table. Raises error if length of new
@@ -742,6 +791,52 @@ module ActiveRecord
         def index_name(table_name, options) # :nodoc:
           _schema, table_name = extract_schema_qualified_name(table_name.to_s)
           super
+        end
+
+        def partitioned_table?(table_name) # :nodoc:
+          supports_native_partitioning? && table_partition_definition(table_name).present?
+        end
+
+        def partition_names_for(table_name) # :nodoc:
+          scope = quoted_scope(table_name, type: "BASE TABLE")
+          query_values(<<~SQL)
+            SELECT child.oid::regclass::text
+            FROM pg_catalog.pg_inherits i
+              JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid
+              JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid
+              LEFT JOIN pg_namespace n ON n.oid = parent.relnamespace
+            WHERE parent.relname = #{scope[:name]}
+              AND parent.relkind = 'p'
+              AND n.nspname = #{scope[:schema]}
+          SQL
+        end
+
+        def partition_index_name(parent_index_name, partition_name) # :nodoc:
+          identifier = "#{parent_index_name}_#{partition_name}"
+          if identifier.bytesize <= max_index_name_size
+            identifier
+          else
+            hashed_identifier = "_" + OpenSSL::Digest::SHA256.hexdigest(identifier).first(10)
+            short_limit = max_index_name_size - hashed_identifier.bytesize
+            "#{identifier.truncate_bytes(short_limit, omission: nil)}#{hashed_identifier}"
+          end
+        end
+
+        def create_index_sql(table_name, index, algorithm, if_not_exists) # :nodoc:
+          sql = ["CREATE"]
+          sql << "UNIQUE" if index.unique
+          sql << "INDEX"
+          sql << algorithm if algorithm
+          sql << "IF NOT EXISTS" if if_not_exists
+          sql << index.type if index.type
+          sql << "#{quote_column_name(index.name)} ON #{quote_table_name(table_name)}"
+          sql << "USING #{index.using}" if index.using
+          columns_sql = String === index.columns ? index.columns : quoted_columns_for_index(index.columns, index.column_options)
+          sql << "(#{columns_sql})"
+          sql << "INCLUDE (#{quoted_include_columns_for_index(index.include)})" if supports_index_include? && index.include
+          sql << "NULLS NOT DISTINCT" if supports_nulls_not_distinct? && index.nulls_not_distinct
+          sql << "WHERE #{index.where}" if supports_partial_index? && index.where
+          sql.join(" ")
         end
 
         def add_foreign_key(from_table, to_table, **options)
